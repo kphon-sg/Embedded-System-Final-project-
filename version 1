@@ -1,0 +1,677 @@
+#include <LPC17xx.h>
+#include "cmsis_os.h"
+#include "Board_LED.h"
+#include "Board_GLCD.h"
+#include <stdio.h>
+
+#define MENU_ITEMS 10 // Increased from 8 to 9
+#define White 0xFFFFFF
+#define Black 0x000000
+#define Blue 0x0000FF
+#define Red 0xFF0000
+#define Green 0x00FF00
+volatile uint32_t pumpDuration = 0; 
+
+
+volatile uint32_t seconds = 0;
+volatile uint32_t minutes = 0;
+volatile uint32_t hours = 0;
+
+
+extern GLCD_FONT GLCD_Font_16x24;
+
+osThreadId tid_joystick;
+osThreadId tid_screen;
+osMutexId glcd_mutex;
+
+typedef struct {
+    const char* name;
+    void (*action)(void);
+} MenuItem;
+
+MenuItem menuItems[MENU_ITEMS];
+volatile int currentSelection = 0;
+
+// Joystick pin definitions
+#define JOYSTICK_UP_PIN     (1 << 23)  // P1.23
+#define JOYSTICK_DOWN_PIN   (1 << 25)  // P1.25
+#define JOYSTICK_CENTER_PIN (1 << 20)  // P1.20
+
+#define DEBOUNCE_TIME 200
+int lastJoystickState = 0;
+uint32_t lastActionTime = 0;
+
+// ADC Definitions
+#define VREF       3.3 // Reference Voltage at VREFP pin, given VREFN = 0V (GND)
+#define ADC_CLK_EN (1<<12)
+#define SEL_AD0_2  (1<<2) // Select Channel AD0.2 (P0.25)
+#define CLKDIV     1      // ADC clock-divider (ADC_CLOCK=PCLK/(CLKDIV+1)) = 12.5Mhz
+#define PWRUP      (1<<21) // Setting it to 0 will power it down
+#define START_CNV  (1<<24) // 001 for starting the conversion immediately
+#define ADC_DONE   (1U<<31) // Define as unsigned value for Done Bit
+#define ADCR_SETUP_SCM ((CLKDIV<<8) | PWRUP)
+
+// LED pin definition
+#define LED_PIN_P1_28 (1 << 28) // P1.28 for LED
+
+#define LED_PIN_P1_29 (1 << 29) // P1.29
+#define LED_PIN_P1_31 (1 << 31) // P1.31
+#define LED_PIN_P2_2  (1 << 2)  // P2.2
+#define LED_PIN_P2_3  (1 << 3)  // P2.3
+#define LED_PIN_P2_4  (1 << 4)  // P2.4
+#define LED_PIN_P2_5  (1 << 5)  // P2.5
+#define LED_PIN_P2_6  (1 << 6)  // P2.6
+
+// Initialize Joystick GPIOs
+void GPIO_Joystick_Init(void) {
+    LPC_PINCON->PINSEL3 &= ~((3 << 14) | (3 << 18) | (3 << 8));    // Set P1.23, P1.25, P1.20 to GPIO
+    LPC_PINCON->PINMODE3 &= ~((3 << 14) | (3 << 18) | (3 << 8));  // Enable pull-up resistors
+    LPC_GPIO1->FIODIR &= ~(JOYSTICK_UP_PIN | JOYSTICK_DOWN_PIN | JOYSTICK_CENTER_PIN); // Set as input
+}
+
+// Initialize LED GPIO (P1.28)
+void GPIO_LED_Init(void) {
+    // Configure Port 1 pins (P1.28, P1.29, P1.31)
+    LPC_PINCON->PINSEL3 &= ~((3 << 24) | (3 << 26) | (3 << 30)); // Clear PINSEL for P1.28, P1.29, P1.31
+    LPC_PINCON->PINMODE3 &= ~((3 << 24) | (3 << 26) | (3 << 30)); // Disable pull-up/pull-down
+    LPC_GPIO1->FIODIR |= (LED_PIN_P1_28 | LED_PIN_P1_29 | LED_PIN_P1_31); // Set as output
+    LPC_GPIO1->FIOCLR = (LED_PIN_P1_28 | LED_PIN_P1_29 | LED_PIN_P1_31); // Initially off
+
+    // Configure Port 2 pins (P2.2, P2.3, P2.4, P2.5, P2.6)
+    LPC_PINCON->PINSEL4 &= ~((3 << 4) | (3 << 6) | (3 << 8) | (3 << 10) | (3 << 12)); // Clear PINSEL for P2.2 to P2.6
+    LPC_PINCON->PINMODE4 &= ~((3 << 4) | (3 << 6) | (3 << 8) | (3 << 10) | (3 << 12)); // Disable pull-up/pull-down
+    LPC_GPIO2->FIODIR |= (LED_PIN_P2_2 | LED_PIN_P2_3 | LED_PIN_P2_4 | LED_PIN_P2_5 | LED_PIN_P2_6); // Set as output
+    LPC_GPIO2->FIOCLR = (LED_PIN_P2_2 | LED_PIN_P2_3 | LED_PIN_P2_4 | LED_PIN_P2_5 | LED_PIN_P2_6); // Initially off
+}
+
+
+
+uint32_t readJoystick(void) {
+    uint32_t state = 0;
+    if (!(LPC_GPIO1->FIOPIN & JOYSTICK_UP_PIN))     state |= 0x01;
+    if (!(LPC_GPIO1->FIOPIN & JOYSTICK_DOWN_PIN))   state |= 0x02;
+    if (!(LPC_GPIO1->FIOPIN & JOYSTICK_CENTER_PIN)) state |= 0x04;
+    return state;
+}
+
+void showActionMessage(const char* message, uint32_t color) {
+    osMutexWait(glcd_mutex, osWaitForever);
+    GLCD_SetBackgroundColor(White);
+    GLCD_SetForegroundColor(White); // Clear previous message
+    GLCD_DrawString(0, 1 * 24, "                         ");
+    GLCD_SetForegroundColor(color);
+    GLCD_DrawString(0, 1 * 24, message);
+    osMutexRelease(glcd_mutex);
+}
+
+void startPump(void) {
+    // Turn on all specified LEDs
+    LPC_GPIO1->FIOSET = (LED_PIN_P1_28 | LED_PIN_P1_29 | LED_PIN_P1_31);
+    LPC_GPIO2->FIOSET = (LED_PIN_P2_2 | LED_PIN_P2_3 | LED_PIN_P2_4 | LED_PIN_P2_5 | LED_PIN_P2_6);
+    showActionMessage("Pump Started", Green);
+    LED_On(0); // Retain original board LED control (if mapped to another pin)
+}
+void stopPump(void) {
+    // Turn off all specified LEDs
+    LPC_GPIO1->FIOCLR = (LED_PIN_P1_28 | LED_PIN_P1_29 | LED_PIN_P1_31);
+    LPC_GPIO2->FIOCLR = (LED_PIN_P2_2 | LED_PIN_P2_3 | LED_PIN_P2_4 | LED_PIN_P2_5 | LED_PIN_P2_6);
+    showActionMessage("Pump Stopped", Red);
+    LED_Off(0); // Retain original board LED control
+}
+void setPumpSpeed(void)       { showActionMessage("Set Pump Speed", Blue); }
+void setPumpDuration(void) {
+    char durationString[20];
+    uint32_t current_joystick_state;
+    uint32_t prev_joystick_state = 0;
+    uint32_t last_action_time = 0;
+
+    // Display duration setting interface
+    osMutexWait(glcd_mutex, osWaitForever);
+    GLCD_SetBackgroundColor(White);
+    GLCD_ClearScreen();
+    GLCD_SetForegroundColor(Blue);
+    GLCD_DrawString(0, 0 * 24, "Set Pump Duration");
+    GLCD_DrawString(0, 2 * 24, "Use joystick to adjust");
+    GLCD_DrawString(0, 3 * 24, "duration (seconds)");
+    GLCD_SetForegroundColor(Red);
+    GLCD_DrawString(0, 5 * 24, "Center to confirm");
+    GLCD_SetForegroundColor(Black);
+    sprintf(durationString, "Duration: %ld s", pumpDuration);
+    GLCD_DrawString(0, 4 * 24, durationString);
+    osMutexRelease(glcd_mutex);
+
+    while (1) {
+        current_joystick_state = readJoystick();
+        uint32_t currentTime = osKernelSysTick();
+
+        if (currentTime - last_action_time >= DEBOUNCE_TIME) {
+            if ((current_joystick_state & 0x01) && !(prev_joystick_state & 0x01)) { // Up pressed
+                pumpDuration += 10; // Increase by 10 seconds
+                if (pumpDuration > 3600) pumpDuration = 3600; // Cap at 1 hour
+                last_action_time = currentTime;
+                osMutexWait(glcd_mutex, osWaitForever);
+                GLCD_SetBackgroundColor(White);
+                GLCD_SetForegroundColor(Black);
+                GLCD_DrawString(0, 4 * 24, "                    ");
+                sprintf(durationString, "Duration: %ld s", pumpDuration);
+                GLCD_DrawString(0, 4 * 24, durationString);
+                osMutexRelease(glcd_mutex);
+            }
+            if ((current_joystick_state & 0x02) && !(prev_joystick_state & 0x02)) { // Down pressed
+                if (pumpDuration >= 10) pumpDuration -= 10; // Decrease by 10 seconds
+                else pumpDuration = 0; // Minimum 0 seconds
+                last_action_time = currentTime;
+                osMutexWait(glcd_mutex, osWaitForever);
+                GLCD_SetBackgroundColor(White);
+                GLCD_SetForegroundColor(Black);
+                GLCD_DrawString(0, 4 * 24, "                    ");
+                sprintf(durationString, "Duration: %ld s", pumpDuration);
+                GLCD_DrawString(0, 4 * 24, durationString);
+                osMutexRelease(glcd_mutex);
+            }
+            if ((current_joystick_state & 0x04) && !(prev_joystick_state & 0x04)) { // Center pressed
+                last_action_time = currentTime;
+                break;
+            }
+        }
+        prev_joystick_state = current_joystick_state;
+        osDelay(20);
+    }
+
+    // Restore main menu
+    osMutexWait(glcd_mutex, osWaitForever);
+    GLCD_SetBackgroundColor(White);
+    GLCD_ClearScreen();
+    GLCD_SetForegroundColor(Blue);
+    GLCD_DrawString(0, 0, "Pump Control System");
+    GLCD_SetForegroundColor(Black);
+    osMutexRelease(glcd_mutex);
+    displayMenu();
+    showActionMessage("Duration Set", Blue);
+}
+
+void viewStatus(void)         { showActionMessage("Viewing Status", Blue); }
+void maintenanceMode(void)    { showActionMessage("Maintenance Mode", Blue); }
+void exitMenu(void)           { showActionMessage("Exiting Menu", Red); }
+
+// Function prototype for displayMenu
+void displayMenu(void);
+
+// Global LED threshold variable
+float ledThreshold = 1.5; // Shared threshold for LED control
+
+void setAlarmThreshold(void) {
+    char Threshold_String[20];
+    uint32_t current_joystick_state;
+    uint32_t prev_joystick_state = 0; // To detect button press release
+    uint32_t last_action_time = 0;
+
+    // Clear screen and display threshold adjustment interface
+    osMutexWait(glcd_mutex, osWaitForever);
+    GLCD_SetBackgroundColor(White);
+    GLCD_ClearScreen();
+    GLCD_SetForegroundColor(Blue);
+    GLCD_DrawString(0, 0 * 24, "Set Alarm Threshold");
+    GLCD_DrawString(0, 2 * 24, "Use joystick to change");
+    GLCD_DrawString(0, 3 * 24, "threshold value");
+    GLCD_SetForegroundColor(Red);
+    GLCD_DrawString(0, 5 * 24, "Center to confirm");
+    GLCD_SetForegroundColor(Black);
+    sprintf(Threshold_String, "Threshold: %.2f V", ledThreshold);
+    GLCD_DrawString(0, 4 * 24, Threshold_String);
+    osMutexRelease(glcd_mutex);
+
+    while (1) {
+        // Read joystick state
+        current_joystick_state = readJoystick();
+        uint32_t currentTime = osKernelSysTick();
+
+        // Handle joystick inputs with debouncing
+        if (currentTime - last_action_time >= DEBOUNCE_TIME) {
+            if ((current_joystick_state & 0x01) && !(prev_joystick_state & 0x01)) { // Up pressed
+                ledThreshold += 0.1; // Increase threshold by 0.1V
+                if (ledThreshold > 3.3) ledThreshold = 3.3; // Cap at 3.3V
+                last_action_time = currentTime;
+                // Update display
+                osMutexWait(glcd_mutex, osWaitForever);
+                GLCD_SetBackgroundColor(White);
+                GLCD_SetForegroundColor(Black);
+                GLCD_DrawString(0, 4 * 24, "                    "); // Clear previous
+                sprintf(Threshold_String, "Threshold: %.2f V", ledThreshold);
+                GLCD_DrawString(0, 4 * 24, Threshold_String);
+                osMutexRelease(glcd_mutex);
+            }
+            if ((current_joystick_state & 0x02) && !(prev_joystick_state & 0x02)) { // Down pressed
+                ledThreshold -= 0.1; // Decrease threshold by 0.1V
+                if (ledThreshold < 0.0) ledThreshold = 0.0; // Floor at 0.0V
+                last_action_time = currentTime;
+                // Update display
+                osMutexWait(glcd_mutex, osWaitForever);
+                GLCD_SetBackgroundColor(White);
+                GLCD_SetForegroundColor(Black);
+                GLCD_DrawString(0, 4 * 24, "                    "); // Clear previous
+                sprintf(Threshold_String, "Threshold: %.2f V", ledThreshold);
+                GLCD_DrawString(0, 4 * 24, Threshold_String);
+                osMutexRelease(glcd_mutex);
+            }
+            if ((current_joystick_state & 0x04) && !(prev_joystick_state & 0x04)) { // Center pressed
+                last_action_time = currentTime;
+                break; // Exit threshold setting
+            }
+        }
+        prev_joystick_state = current_joystick_state;
+        osDelay(20); // Short delay for responsive input
+    }
+
+    // Restore main menu display
+    osMutexWait(glcd_mutex, osWaitForever);
+    GLCD_SetBackgroundColor(White);
+    GLCD_ClearScreen();
+    GLCD_SetForegroundColor(Blue);
+    GLCD_DrawString(0, 0, "Pump Control System");
+    GLCD_SetForegroundColor(Black);
+    osMutexRelease(glcd_mutex);
+    displayMenu();
+    showActionMessage("Threshold Set", Blue);
+}
+
+void displayADCValue(void) {
+    char ADC_String[20];
+    int bar_value;
+    float volts = 0;
+    uint32_t current_joystick_state;
+    uint32_t prev_joystick_state = 0; // To detect button press release
+    uint32_t adc_last_action_time = 0;
+    // Moving average filter variables
+    #define ADC_AVG_SAMPLES 8
+    float adc_buffer[ADC_AVG_SAMPLES] = {0};
+    int adc_buffer_index = 0;
+    float adc_sum = 0;
+
+    osMutexWait(glcd_mutex, osWaitForever);
+    // Prepare screen for ADC display
+    GLCD_SetBackgroundColor(White);
+    GLCD_ClearScreen(); // Clear the entire screen once
+    GLCD_SetForegroundColor(Black);
+    GLCD_DrawString(0, 0 * 24, "ADC Voltage Display");
+    GLCD_DrawString(0, 1 * 24, "P0.25 (AD0.2)");
+    GLCD_DrawString(0, 3 * 24, "Voltage Bar Graph");
+    GLCD_DrawString(0, 6 * 24, "0V");
+    GLCD_DrawString(200, 6 * 24, "3.3V");
+    GLCD_SetForegroundColor(Red);
+    GLCD_DrawString(0, 8 * 24, "Press Center to Exit");
+    // Draw static bar graph border
+    GLCD_SetForegroundColor(Black);
+    GLCD_DrawRectangle(10, 120, 200, 20); // Outline the bar graph area
+    osMutexRelease(glcd_mutex);
+
+    // ADC Initialization
+    LPC_SC->PCONP |= ADC_CLK_EN; // Enable ADC clock
+    LPC_ADC->ADCR = ADCR_SETUP_SCM | SEL_AD0_2;
+    LPC_PINCON->PINSEL1 &= ~(3 << 18); // Clear bits for P0.25
+    LPC_PINCON->PINSEL1 |= (1 << 18); // Select AD0.2 for P0.25
+    LPC_PINCON->PINMODE1 &= ~(3 << 18); // Clear bits for P0.25 pull-up/down
+    LPC_PINCON->PINMODE1 |= (2 << 18); // Disable pull-up/pull-down for P0.25
+
+    while (1) {
+        // Read ADC sample
+        LPC_ADC->ADCR |= START_CNV; // Start new conversion
+        while ((LPC_ADC->ADDR2 & ADC_DONE) == 0); // Wait until conversion is finished
+        int result = (LPC_ADC->ADDR2 >> 4) & 0xFFF; // 12-bit result
+        float new_volts = (result * VREF) / 4095.0; // Convert to voltage (0–3.3V)
+
+        // Update moving average
+        adc_sum -= adc_buffer[adc_buffer_index]; // Subtract oldest sample
+        adc_buffer[adc_buffer_index] = new_volts; // Add new sample
+        adc_sum += new_volts;
+        adc_buffer_index = (adc_buffer_index + 1) % ADC_AVG_SAMPLES;
+        volts = adc_sum / ADC_AVG_SAMPLES; // Compute average
+
+        // Control LED on P1.28 based on global threshold
+        if (volts > ledThreshold) {
+            LPC_GPIO1->FIOSET = LED_PIN_P1_28; // Turn LED on
+        } else {
+            LPC_GPIO1->FIOCLR = LED_PIN_P1_28; // Turn LED off
+        }
+
+        // Scale bar_value to graph width (200 pixels for 0–3.3V)
+        bar_value = (int)(volts * 200 / 3.3); // 200 pixels max width
+
+        sprintf(ADC_String, "Volts: %.3f V", volts); // Format to 3 decimal places
+
+        osMutexWait(glcd_mutex, osWaitForever);
+        GLCD_SetBackgroundColor(White);
+        GLCD_SetForegroundColor(Blue);
+        // Clear previous voltage text
+        GLCD_DrawString(0, 4 * 24, "                    ");
+        GLCD_DrawString(0, 4 * 24, ADC_String);
+
+        // Clear previous bar graph (only the filled portion)
+        GLCD_SetForegroundColor(White);
+        GLCD_DrawRectangle(10, 120, 200, 20); // Clear bar area
+        // Draw new bar graph
+        GLCD_SetForegroundColor(Green); // Green for the bar
+        GLCD_DrawBargraph(10, 120, 200, 20, bar_value * 100 / 200); // Horizontal bar
+        // Redraw border to ensure it’s not overwritten
+        GLCD_SetForegroundColor(Black);
+        GLCD_DrawRectangle(10, 120, 200, 20); // Outline
+
+        osMutexRelease(glcd_mutex);
+
+        // Check joystick for exit
+        current_joystick_state = readJoystick();
+        uint32_t currentTime = osKernelSysTick();
+
+        if (currentTime - adc_last_action_time >= DEBOUNCE_TIME) {
+            if ((current_joystick_state & 0x04) && !(prev_joystick_state & 0x04)) { // Center pressed
+                adc_last_action_time = currentTime;
+                // Turn off LED when exiting ADC display
+                LPC_GPIO1->FIOCLR = LED_PIN_P1_28;
+                break; // Exit the ADC display loop
+            }
+        }
+        prev_joystick_state = current_joystick_state;
+        osDelay(100); // Slower update rate (100ms) for smoother display
+    }
+
+    // Restore main menu display
+    osMutexWait(glcd_mutex, osWaitForever);
+    GLCD_SetBackgroundColor(White);
+    GLCD_ClearScreen();
+    GLCD_SetForegroundColor(Blue);
+    GLCD_DrawString(0, 0, "Pump Control System");
+    GLCD_SetForegroundColor(Black);
+    osMutexRelease(glcd_mutex);
+    displayMenu();
+    showActionMessage("Exited ADC View", Blue);
+}
+
+void Timer1_Init(void) {
+    LPC_SC->PCONP |= (1 << 2); // Power on Timer1
+    LPC_SC->PCLKSEL0 &= ~(3 << 4); // Clear PCLK selection for Timer1
+    LPC_SC->PCLKSEL0 |= (1 << 4); // Set PCLK = CCLK (100 MHz)
+    
+    LPC_TIM1->TCR = 0x02; // Reset timer
+    LPC_TIM1->PR = 99; // Prescaler for 1 MHz clock (100 MHz / (99+1))
+    LPC_TIM1->MR0 = 999999; // Match at 1 MHz (1 second)
+    LPC_TIM1->MCR = (1 << 0) | (1 << 1); // Interrupt and reset on MR0 match
+    LPC_TIM1->TCR = 0x01; // Enable timer
+    
+    NVIC_EnableIRQ(TIMER1_IRQn); // Enable Timer1 interrupt
+}
+
+void displayClock(void) {
+    char timeString[20];
+    uint32_t current_joystick_state;
+    uint32_t prev_joystick_state = 0;
+    uint32_t last_action_time = 0;
+    int last_hours = -1, last_minutes = -1, last_seconds = -1; // Luu tr?ng thái tru?c dó
+
+    // Kh?i t?o màn hình
+    osMutexWait(glcd_mutex, osWaitForever);
+    GLCD_SetBackgroundColor(White);
+    GLCD_ClearScreen();
+    GLCD_SetForegroundColor(Blue);
+    GLCD_DrawString(0, 0 * 24, "Clock Display");
+    GLCD_SetForegroundColor(Red);
+    GLCD_DrawString(0, 6 * 24, "Press Center to Exit");
+    osMutexRelease(glcd_mutex);
+
+    while (1) {
+        // Ki?m tra n?u th?i gian thay d?i
+        if (hours != last_hours || minutes != last_minutes || seconds != last_seconds) {
+            osMutexWait(glcd_mutex, osWaitForever);
+            GLCD_SetForegroundColor(Black);
+
+            // Ch? v? l?i ph?n gi? n?u thay [hours] thay d?i
+            if (hours != last_hours) {
+                sprintf(timeString, "%02d", hours);
+                GLCD_DrawString(0, 3 * 24, timeString); // V? gi?
+                last_hours = hours;
+            }
+
+            // V? d?u ":" gi?a gi? và phút (ch? c?n v? m?t l?n d?u tiên)
+            if (last_hours == -1) {
+                GLCD_DrawString(3 * 8, 3 * 24, ":"); // Tang kho?ng cách: 3 * 8 thay vì 2 * 8
+            }
+
+            // Ch? v? l?i ph?n phút n?u thay d?i
+            if (minutes != last_minutes) {
+                sprintf(timeString, "%02d", minutes);
+                GLCD_DrawString(5 * 8, 3 * 24, timeString); // V? phút, tang kho?ng cách: 5 * 8 thay vì 3 * 8
+                last_minutes = minutes;
+            }
+
+            // V? d?u ":" gi?a phút và giây (ch? c?n v? m?t l?n d?u tiên)
+            if (last_minutes == -1) {
+                GLCD_DrawString(8 * 8, 3 * 24, ":"); // Tang kho?ng cách: 8 * 8 thay vì 5 * 8
+            }
+
+            // Ch? v? l?i ph?n giây n?u thay d?i
+            if (seconds != last_seconds) {
+                sprintf(timeString, "%02d", seconds);
+                GLCD_DrawString(10 * 8, 3 * 24, timeString); // V? giây, tang kho?ng cách: 10 * 8 thay vì 6 * 8
+                last_seconds = seconds;
+            }
+
+            osMutexRelease(glcd_mutex);
+        }
+
+        // Ki?m tra joystick d? thoát
+        current_joystick_state = readJoystick();
+        uint32_t currentTime = osKernelSysTick();
+
+        if (currentTime - last_action_time >= DEBOUNCE_TIME) {
+            if ((current_joystick_state & 0x04) && !(prev_joystick_state & 0x04)) {
+                last_action_time = currentTime;
+
+                // Reset gi?, phút, giây v? 0
+                hours = 0;
+                minutes = 0;
+                seconds = 0;
+                last_hours = -1;
+                last_minutes = -1;
+                last_seconds = -1; // Ð?t l?i tr?ng thái d? bu?c v? l?i toàn b? th?i gian
+
+                // C?p nh?t hi?n th? th?i gian dã reset tru?c khi thoát
+                osMutexWait(glcd_mutex, osWaitForever);
+                GLCD_SetForegroundColor(Black);
+                sprintf(timeString, "%02d", hours);
+                GLCD_DrawString(0, 3 * 24, timeString);
+                GLCD_DrawString(3 * 8, 3 * 24, ":");
+                sprintf(timeString, "%02d", minutes);
+                GLCD_DrawString(5 * 8, 3 * 24, timeString);
+                GLCD_DrawString(8 * 8, 3 * 24, ":");
+                sprintf(timeString, "%02d", seconds);
+                GLCD_DrawString(10 * 8, 3 * 24, timeString);
+                osMutexRelease(glcd_mutex);
+
+                break;
+            }
+        }
+        prev_joystick_state = current_joystick_state;
+        osDelay(100); // Ki?m tra m?i 100ms d? gi?m d? nh?y
+    }
+
+    // Khôi ph?c hi?n th? menu chính
+    osMutexWait(glcd_mutex, osWaitForever);
+    GLCD_SetBackgroundColor(White);
+    GLCD_ClearScreen();
+    GLCD_SetForegroundColor(Blue);
+    GLCD_DrawString(0, 0, "Pump Control System");
+    GLCD_SetForegroundColor(Black);
+    osMutexRelease(glcd_mutex);
+    displayMenu();
+    showActionMessage("Exited Clock View", Blue);
+}
+
+void initializeMenu(void) {
+    menuItems[0] = (MenuItem){"Start Pump", startPump};
+    menuItems[1] = (MenuItem){"Stop Pump", stopPump};
+    menuItems[2] = (MenuItem){"Pump Speed", setPumpSpeed};
+    menuItems[3] = (MenuItem){"PumpDuration", setPumpDuration};
+    menuItems[4] = (MenuItem){"View Status", viewStatus};
+    menuItems[5] = (MenuItem){"A_Threshold", setAlarmThreshold};
+    menuItems[6] = (MenuItem){"Monitor Mode", maintenanceMode};
+    menuItems[7] = (MenuItem){"Display ADC", displayADCValue};
+		menuItems[8] = (MenuItem){"DisPlay_Clock", displayClock};
+    menuItems[9] = (MenuItem){"Exit Menu", exitMenu};
+}
+
+void displayMenu(void) {
+    osMutexWait(glcd_mutex, osWaitForever);
+    
+    // Xóa màn hình
+    GLCD_SetBackgroundColor(White);
+    GLCD_SetForegroundColor(White);
+    GLCD_DrawString(0, 0, "                "); // Xóa tiêu d?
+    for (int i = 0; i < 3; i++) {
+        GLCD_DrawString(0, (i + 2) * 24, "                    "); // Xóa các dòng
+    }
+    
+    // V? tiêu d?
+    GLCD_SetForegroundColor(Blue);
+    GLCD_DrawString(0, 0, "Pump Control System");
+    
+    // Tính toán ch? s? b?t d?u
+    int startIndex;
+    if (currentSelection == 0) {
+        startIndex = 0; // Hi?n th? 0, 1, 2
+    } else if (currentSelection == MENU_ITEMS - 1) {
+        startIndex = MENU_ITEMS - 3; // Hi?n th? 7, 8, 9
+    } else {
+        startIndex = currentSelection - 1; // Hi?n th? previous, current, next
+    }
+    
+    // Ð?m b?o startIndex h?p l?
+    if (startIndex < 0) startIndex = 0;
+    if (startIndex > MENU_ITEMS - 3) startIndex = MENU_ITEMS - 3;
+    
+    // Hi?n th? 3 m?c
+    for (int i = 0; i < 3 && (startIndex + i) < MENU_ITEMS; i++) {
+        int index = startIndex + i;
+        if (index == currentSelection) {
+            GLCD_SetBackgroundColor(Blue);
+            GLCD_SetForegroundColor(White);
+        } else {
+            GLCD_SetBackgroundColor(White);
+            GLCD_SetForegroundColor(Black);
+        }
+        char displayText[35];
+        sprintf(displayText, "%-20s", menuItems[index].name);
+        GLCD_DrawString(0, (i + 2) * 24, displayText);
+    }
+    
+    osMutexRelease(glcd_mutex);
+}
+
+void joystickControlThread(void const *argument) {
+    while (1) {
+        uint32_t joystickState = readJoystick();
+        uint32_t currentTime = osKernelSysTick();
+
+        // LED Debug
+        if (joystickState & 0x01) LED_On(1); else LED_Off(1); // UP
+        if (joystickState & 0x02) LED_On(2); else LED_Off(2); // DOWN
+        if (joystickState & 0x04) LED_On(3); else LED_Off(3); // CENTER
+
+        if (currentTime - lastActionTime >= DEBOUNCE_TIME) {
+            if ((joystickState & 0x01) && !(lastJoystickState & 0x01)) { // Up pressed
+                int oldSel = currentSelection;
+                currentSelection = (currentSelection - 1 + MENU_ITEMS) % MENU_ITEMS;
+                displayMenu(); // V? l?i 3 m?c
+                lastActionTime = currentTime;
+                showActionMessage(" ", Black);
+            }
+            if ((joystickState & 0x02) && !(lastJoystickState & 0x02)) { // Down pressed
+                int oldSel = currentSelection;
+                currentSelection = (currentSelection + 1) % MENU_ITEMS;
+                displayMenu(); // V? l?i 3 m?c
+                lastActionTime = currentTime;
+                showActionMessage(" ", Black);
+            }
+            if ((joystickState & 0x04) && !(lastJoystickState & 0x04)) { // Center pressed
+                menuItems[currentSelection].action();
+                lastActionTime = currentTime;
+            }
+        }
+        lastJoystickState = joystickState;
+        osDelay(20);
+    }
+}
+
+void menuDisplayThread(void const *argument) {
+    while (1) {
+        osDelay(1000);
+    }
+}
+
+void TIMER1_IRQHandler(void) {
+    if (LPC_TIM1->IR & (1 << 0)) { // Check if MR0 interrupt
+        seconds++;
+        if (seconds >= 60) {
+            seconds = 0;
+            minutes++;
+            if (minutes >= 60) {
+                minutes = 0;
+                hours++;
+                if (hours >= 24) {
+                    hours = 0;
+                }
+            }
+        }
+        LPC_TIM1->IR = (1 << 0); // Clear MR0 interrupt flag
+    }
+}
+
+osThreadDef(joystickControlThread, osPriorityNormal, 1, 0);
+osThreadDef(menuDisplayThread, osPriorityNormal, 1, 0);
+osMutexDef(glcd_mutex);
+
+int main(void) {
+    SystemInit();
+    LED_Initialize();
+    GLCD_Initialize();
+    GPIO_Joystick_Init();
+    GPIO_LED_Init(); // Initialize P1.28 for LED
+		Timer1_Init() ; 
+    LPC_SC->PCONP |= (1 << 2); // Power on Timer1
+    LPC_SC->PCLKSEL0 &= ~(3 << 4); // Clear PCLK selection for Timer1
+    LPC_SC->PCLKSEL0 |= (1 << 4); // Set PCLK = CCLK (100 MHz)
+    
+    LPC_TIM1->TCR = 0x02; // Reset timer
+    LPC_TIM1->PR = 99; // Prescaler for 1 MHz clock (100 MHz / (99+1))
+    LPC_TIM1->MR0 = 999999; // Match at 1 MHz (1 second)
+    LPC_TIM1->MCR = (1 << 0) | (1 << 1); // Interrupt and reset on MR0 match
+    LPC_TIM1->TCR = 0x01; // Enable timer
+    
+    NVIC_EnableIRQ(TIMER1_IRQn); // Enable Timer1 interrupt
+
+    GLCD_SetFont(&GLCD_Font_16x24);
+    GLCD_SetBackgroundColor(White);
+    GLCD_ClearScreen();
+
+    GLCD_SetForegroundColor(Blue);
+    GLCD_DrawString(0, 0, "Pump Control System");
+
+    initializeMenu();
+
+    osKernelInitialize();
+    glcd_mutex = osMutexCreate(osMutex(glcd_mutex));
+    if (glcd_mutex == NULL) {
+        while(1);
+    }
+
+    displayMenu();
+
+    tid_joystick = osThreadCreate(osThread(joystickControlThread), NULL);
+    tid_screen = osThreadCreate(osThread(menuDisplayThread), NULL);
+
+    if (!tid_joystick || !tid_screen) {
+        while(1);
+    }
+
+    osKernelStart();
+
+    while (1);
+}
